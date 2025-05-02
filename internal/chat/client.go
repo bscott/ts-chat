@@ -11,38 +11,65 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your-username/ts-chat/internal/ui"
+	"github.com/bscott/ts-chat/internal/ui"
+)
+
+// Constants for rate limiting and validation
+const (
+	MaxMessageLength = 1000     // Maximum message length in characters
+	MessageRateLimit = 5        // Maximum messages per second
+	RateLimitWindow  = 5 * time.Second // Time window for rate limiting
 )
 
 // Client represents a chat client
 type Client struct {
-	Nickname string
-	conn     net.Conn
-	reader   *bufio.Reader
-	writer   *bufio.Writer
-	room     *Room
-	mu       sync.Mutex // Mutex to protect concurrent writes
+	Nickname          string
+	conn              net.Conn
+	reader            *bufio.Reader
+	writer            *bufio.Writer
+	room              *Room
+	mu                sync.Mutex // Mutex to protect concurrent writes
+	fullRoomRejection bool       // Flag indicating client was rejected due to room being full
+	messageTimestamps []time.Time // Timestamps of recent messages for rate limiting
+	rateLimitMu       sync.Mutex // Mutex for rate limiting data
 }
 
 // NewClient creates a new chat client
 func NewClient(conn net.Conn, room *Room) (*Client, error) {
 	client := &Client{
-		conn:   conn,
-		reader: bufio.NewReader(conn),
-		writer: bufio.NewWriter(conn),
-		room:   room,
+		conn:              conn,
+		reader:            bufio.NewReader(conn),
+		writer:            bufio.NewWriter(conn),
+		room:              room,
+		fullRoomRejection: false,
+		messageTimestamps: make([]time.Time, 0, MessageRateLimit*2),
 	}
 	
 	// Ask for nickname
 	if err := client.requestNickname(); err != nil {
-		return nil, err
+		// Ensure connection is closed on error
+		conn.Close()
+		return nil, fmt.Errorf("nickname request failed: %w", err)
 	}
 	
 	// Join the room
 	room.Join(client)
 	
+	// Check if client was rejected due to room being full
+	if client.fullRoomRejection {
+		// Close the connection since the room is full
+		conn.Close()
+		return nil, fmt.Errorf("room is full")
+	}
+	
 	// Send welcome message
-	client.sendWelcomeMessage()
+	if err := client.sendWelcomeMessage(); err != nil {
+		// Leave the room since we encountered an error
+		room.Leave(client)
+		// Close the connection
+		conn.Close()
+		return nil, fmt.Errorf("welcome message failed: %w", err)
+	}
 	
 	return client, nil
 }
@@ -50,11 +77,15 @@ func NewClient(conn net.Conn, room *Room) (*Client, error) {
 // requestNickname asks the user for a nickname
 func (c *Client) requestNickname() error {
 	// Send welcome message
-	c.write(ui.FormatTitle("Welcome to Tailscale Terminal Chat") + "\r\n\r\n")
+	if err := c.write(ui.FormatTitle("Welcome to Tailscale Terminal Chat") + "\r\n\r\n"); err != nil {
+		return fmt.Errorf("failed to write welcome message: %w", err)
+	}
 	
 	// Ask for nickname
 	for {
-		c.write(ui.InputStyle.Render("Please enter your nickname: "))
+		if err := c.write(ui.InputStyle.Render("Please enter your nickname: ")); err != nil {
+			return fmt.Errorf("failed to write nickname prompt: %w", err)
+		}
 		
 		// Read nickname
 		nickname, err := c.reader.ReadString('\n')
@@ -67,17 +98,24 @@ func (c *Client) requestNickname() error {
 		
 		// Validate nickname
 		if nickname == "" {
-			c.write("Nickname cannot be empty. Please try again.\r\n")
+			if err := c.write("Nickname cannot be empty. Please try again.\r\n"); err != nil {
+				return fmt.Errorf("failed to write error message: %w", err)
+			}
 			continue
 		}
 		
 		if strings.ToLower(nickname) == "system" {
-			c.write("Nickname 'System' is reserved. Please choose another nickname.\r\n")
+			if err := c.write("Nickname 'System' is reserved. Please choose another nickname.\r\n"); err != nil {
+				return fmt.Errorf("failed to write error message: %w", err)
+			}
 			continue
 		}
 		
 		if !c.room.IsNicknameAvailable(nickname) {
-			c.write(fmt.Sprintf("Nickname '%s' is already taken. Please choose another nickname.\r\n", nickname))
+			errMsg := fmt.Sprintf("Nickname '%s' is already taken. Please choose another nickname.\r\n", nickname)
+			if err := c.write(errMsg); err != nil {
+				return fmt.Errorf("failed to write error message: %w", err)
+			}
 			continue
 		}
 		
@@ -90,7 +128,7 @@ func (c *Client) requestNickname() error {
 }
 
 // sendWelcomeMessage sends a welcome message to the client
-func (c *Client) sendWelcomeMessage() {
+func (c *Client) sendWelcomeMessage() error {
 	banner := `
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║           _____                    _             _   _____             ║
@@ -105,63 +143,172 @@ func (c *Client) sendWelcomeMessage() {
 	coloredBanner := ui.SystemStyle.Render(banner)
 	welcomeMsg := ui.FormatWelcomeMessage(c.room.Name, c.Nickname)
 	
-	c.write(coloredBanner + "\r\n")
-	c.write(welcomeMsg + "\r\n\r\n")
-	c.write("Type a message and press Enter to send. Type /help for commands.\r\n\r\n")
+	if err := c.write(coloredBanner + "\r\n"); err != nil {
+		return fmt.Errorf("failed to write banner: %w", err)
+	}
+	
+	if err := c.write(welcomeMsg + "\r\n\r\n"); err != nil {
+		return fmt.Errorf("failed to write welcome message: %w", err)
+	}
+	
+	if err := c.write("Type a message and press Enter to send. Type /help for commands.\r\n\r\n"); err != nil {
+		return fmt.Errorf("failed to write help message: %w", err)
+	}
+	
+	return nil
 }
 
 // Handle handles client interactions
 func (c *Client) Handle(ctx context.Context) {
+	log.Printf("Starting handler for client %s", c.Nickname)
+	
 	// Cleanup when done
-	defer c.room.Leave(c)
+	defer func() {
+		log.Printf("Client handler for %s is shutting down", c.Nickname)
+		c.room.Leave(c)
+	}()
+	
+	// Create a timeout reader
+	readCh := make(chan readResult)
+	readErrorCh := make(chan error)
 	
 	// Handle client messages
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("Context cancelled for client %s", c.Nickname)
 			return
+			
 		default:
-			// Read message from client
-			line, err := c.reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					// Client disconnected
+			// Use a goroutine for reading to handle timeouts and cancelations
+			go func() {
+				line, err := c.reader.ReadString('\n')
+				if err != nil {
+					readErrorCh <- err
 					return
 				}
+				readCh <- readResult{message: line}
+			}()
+			
+			// Wait for either a message, error, or context cancellation
+			select {
+			case <-ctx.Done():
+				log.Printf("Context cancelled while reading for client %s", c.Nickname)
+				return
+				
+			case err := <-readErrorCh:
+				if err == io.EOF {
+					// Client disconnected normally
+					log.Printf("Client %s disconnected (EOF)", c.Nickname)
+					return
+				}
+				
+				// Try to notify the client of the error
+				log.Printf("Error reading from client %s: %v", c.Nickname, err)
 				c.sendSystemMessage(fmt.Sprintf("Error reading message: %v", err))
 				return
-			}
-			
-			// Trim whitespace
-			message := strings.TrimSpace(line)
-			
-			// Handle command or message
-			if strings.HasPrefix(message, "/") {
-				c.handleCommand(message)
-			} else if message != "" {
-				// Send message to room
-				c.room.Broadcast(Message{
-					From:      c.Nickname,
-					Content:   message,
-					Timestamp: time.Now(),
-				})
+				
+			case result := <-readCh:
+				// Process the message
+				message := strings.TrimSpace(result.message)
+				
+				// Skip empty messages
+				if message == "" {
+					continue
+				}
+				
+				// Validate message length
+				if err := c.validateMessageLength(message); err != nil {
+					log.Printf("Message from %s rejected: %v", c.Nickname, err)
+					c.sendSystemMessage(fmt.Sprintf("Error: %v", err))
+					continue
+				}
+				
+				// Check rate limiting (except for /quit command)
+				if !strings.HasPrefix(message, "/quit") {
+					if err := c.checkRateLimit(); err != nil {
+						log.Printf("Message from %s rate limited: %v", c.Nickname, err)
+						c.sendSystemMessage(fmt.Sprintf("Error: %v", err))
+						continue
+					}
+				}
+				
+				// Handle command or regular message
+				if strings.HasPrefix(message, "/") {
+					if err := c.handleCommand(message); err != nil {
+						log.Printf("Error handling command from %s: %v", c.Nickname, err)
+						c.sendSystemMessage(fmt.Sprintf("Error: %v", err))
+					}
+				} else {
+					// Send message to room
+					c.room.Broadcast(Message{
+						From:      c.Nickname,
+						Content:   message,
+						Timestamp: time.Now(),
+					})
+				}
 			}
 		}
 	}
 }
 
+// readResult holds the result of a read operation
+type readResult struct {
+	message string
+}
+
+// validateMessageLength checks if a message is within the allowed length
+func (c *Client) validateMessageLength(message string) error {
+	if len(message) > MaxMessageLength {
+		return fmt.Errorf("message too long (max %d characters)", MaxMessageLength)
+	}
+	return nil
+}
+
+// checkRateLimit checks if the client is sending messages too quickly
+func (c *Client) checkRateLimit() error {
+	now := time.Now()
+	c.rateLimitMu.Lock()
+	defer c.rateLimitMu.Unlock()
+	
+	// Add current timestamp
+	c.messageTimestamps = append(c.messageTimestamps, now)
+	
+	// Remove timestamps outside the window
+	cutoff := now.Add(-RateLimitWindow)
+	newTimestamps := make([]time.Time, 0, len(c.messageTimestamps))
+	
+	for _, ts := range c.messageTimestamps {
+		if ts.After(cutoff) {
+			newTimestamps = append(newTimestamps, ts)
+		}
+	}
+	
+	c.messageTimestamps = newTimestamps
+	
+	// Check if we have too many messages in the window
+	if len(c.messageTimestamps) > MessageRateLimit {
+		waitTime := c.messageTimestamps[0].Add(RateLimitWindow).Sub(now)
+		return fmt.Errorf("rate limit exceeded (max %d messages per %s). Try again in %.1f seconds", 
+			MessageRateLimit, RateLimitWindow, waitTime.Seconds())
+	}
+	
+	return nil
+}
+
 // handleCommand handles a command from the client
-func (c *Client) handleCommand(cmd string) {
+func (c *Client) handleCommand(cmd string) error {
 	parts := strings.SplitN(cmd, " ", 2)
 	command := strings.ToLower(parts[0])
 	
 	switch command {
 	case "/who":
-		c.showUserList()
+		return c.showUserList()
+		
 	case "/me":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			c.sendSystemMessage("Usage: /me <action>")
-			return
+			return fmt.Errorf("invalid /me command usage")
 		}
 		action := parts[1]
 		c.room.Broadcast(Message{
@@ -170,27 +317,36 @@ func (c *Client) handleCommand(cmd string) {
 			Timestamp: time.Now(),
 			IsAction:  true,
 		})
+		
 	case "/help":
-		c.showHelp()
+		return c.showHelp()
+		
 	case "/quit":
 		c.sendSystemMessage("Goodbye!")
-		c.conn.Close()
+		// We don't return an error here since this is expected behavior
+		if err := c.conn.Close(); err != nil {
+			return fmt.Errorf("error closing connection: %w", err)
+		}
+		
 	default:
 		c.sendSystemMessage(fmt.Sprintf("Unknown command: %s", command))
+		return fmt.Errorf("unknown command: %s", command)
 	}
+	
+	return nil
 }
 
 // showUserList shows the list of users in the room
-func (c *Client) showUserList() {
+func (c *Client) showUserList() error {
 	users := c.room.GetUserList()
 	msg := ui.FormatUserList(c.room.Name, users, c.room.MaxUsers)
-	c.write(msg + "\r\n")
+	return c.write(msg + "\r\n")
 }
 
 // showHelp shows the help message
-func (c *Client) showHelp() {
+func (c *Client) showHelp() error {
 	helpMsg := ui.FormatHelp()
-	c.write(helpMsg + "\r\n")
+	return c.write(helpMsg + "\r\n")
 }
 
 // sendSystemMessage sends a system message to the client
@@ -223,19 +379,65 @@ func (c *Client) sendMessage(msg Message) {
 		formatted = ui.FormatUserMessage(msg.From, msg.Content, timeStr) + "\r\n"
 	}
 	
+	// Use a safer approach to write to client
+	// Create a channel to receive any errors from the goroutine
+	errCh := make(chan error, 1)
+	
 	// Ensure the write happens without blocking
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Recovered from panic in sendMessage: %v", r)
+				errCh <- fmt.Errorf("panic in sendMessage: %v", r)
+			}
+			close(errCh)
+		}()
+		
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		c.writer.WriteString(formatted)
-		c.writer.Flush()
+		
+		// Check if connection is still valid
+		if c.conn == nil {
+			errCh <- fmt.Errorf("connection closed")
+			return
+		}
+		
+		if _, err := c.writer.WriteString(formatted); err != nil {
+			errCh <- fmt.Errorf("error writing message: %w", err)
+			return
+		}
+		
+		if err := c.writer.Flush(); err != nil {
+			errCh <- fmt.Errorf("error flushing message: %w", err)
+			return
+		}
+	}()
+	
+	// Log any errors (non-blocking)
+	go func() {
+		for err := range errCh {
+			log.Printf("Error sending message to %s: %v", c.Nickname, err)
+		}
 	}()
 }
 
 // write writes a message to the client
-func (c *Client) write(message string) {
+func (c *Client) write(message string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.writer.WriteString(message)
-	c.writer.Flush()
+	
+	// Check if connection is still valid
+	if c.conn == nil {
+		return fmt.Errorf("connection closed")
+	}
+	
+	if _, err := c.writer.WriteString(message); err != nil {
+		return fmt.Errorf("error writing message: %w", err)
+	}
+	
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("error flushing message: %w", err)
+	}
+	
+	return nil
 }

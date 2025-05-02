@@ -8,7 +8,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/your-username/ts-chat/internal/chat"
+	"github.com/bscott/ts-chat/internal/chat"
 	"tailscale.com/tsnet"
 )
 
@@ -67,8 +67,10 @@ func (s *Server) Start() error {
 			status, err := ln.Status(s.ctx)
 			if err != nil {
 				log.Printf("Warning: unable to get Tailscale status: %v", err)
-			} else if status.Self.DNSName != "" {
+			} else if status != nil && status.Self != nil && status.Self.DNSName != "" {
 				log.Printf("Tailscale node running as: %s", status.Self.DNSName)
+			} else {
+				log.Printf("Tailscale node running but DNS name not available yet")
 			}
 		}
 	} else {
@@ -154,8 +156,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 // Stop stops the chat server
 func (s *Server) Stop() error {
+	log.Print("Stopping chat server...")
+	
 	// Cancel the context to signal shutdown
 	s.cancel()
+	
+	// Stop the chat room
+	if s.chatRoom != nil {
+		log.Print("Stopping chat room...")
+		if err := s.chatRoom.Stop(); err != nil {
+			log.Printf("Error stopping chat room: %v", err)
+		}
+	}
 	
 	// Close all active connections
 	s.mu.Lock()
@@ -184,5 +196,6 @@ func (s *Server) Stop() error {
 	// Wait for all goroutines to finish
 	s.wg.Wait()
 	
+	log.Print("Chat server stopped")
 	return nil
 }

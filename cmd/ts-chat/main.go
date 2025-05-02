@@ -8,7 +8,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/pflag"
-	"github.com/your-username/ts-chat/internal/server"
+	"github.com/bscott/ts-chat/internal/server"
 )
 
 // Default configuration values

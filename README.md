@@ -19,7 +19,7 @@ A terminal-based chat application built in Go. The chat server allows multiple u
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/ts-chat.git
+git clone https://github.com/bscott/ts-chat.git
 cd ts-chat
 
 # Build the binary

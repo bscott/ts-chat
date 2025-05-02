@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -25,10 +26,14 @@ type Room struct {
 	join      chan *Client
 	leave     chan *Client
 	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 // NewRoom creates a new chat room
 func NewRoom(name string, maxUsers int) *Room {
+	ctx, cancel := context.WithCancel(context.Background())
 	room := &Room{
 		Name:      name,
 		MaxUsers:  maxUsers,
@@ -36,6 +41,9 @@ func NewRoom(name string, maxUsers int) *Room {
 		broadcast: make(chan Message),
 		join:      make(chan *Client),
 		leave:     make(chan *Client),
+		ctx:       ctx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 	
 	go room.run()
@@ -44,8 +52,12 @@ func NewRoom(name string, maxUsers int) *Room {
 
 // run handles room events
 func (r *Room) run() {
+	defer close(r.done)
 	for {
 		select {
+		case <-r.ctx.Done():
+			log.Printf("Room '%s' is shutting down", r.Name)
+			return
 		case client := <-r.join:
 			r.addClient(client)
 		case client := <-r.leave:
@@ -63,8 +75,11 @@ func (r *Room) addClient(c *Client) {
 	
 	// Check if room is full
 	if len(r.clients) >= r.MaxUsers {
+		// Send message but don't close connection here
+		// Connection handling should be done by the caller
 		c.sendSystemMessage("Sorry, the room is full. Try again later.")
-		c.conn.Close()
+		// Signal that the client wasn't added by setting a flag
+		c.fullRoomRejection = true
 		return
 	}
 	
@@ -147,4 +162,23 @@ func (r *Room) IsNicknameAvailable(nickname string) bool {
 	
 	_, exists := r.clients[nickname]
 	return !exists
+}
+
+// Stop gracefully shuts down the room
+func (r *Room) Stop() error {
+	log.Printf("Stopping room '%s'", r.Name)
+	
+	// Cancel the context to signal the run loop to exit
+	r.cancel()
+	
+	// Wait for the run goroutine to finish
+	<-r.done
+	
+	// Close all channels
+	close(r.broadcast)
+	close(r.join)
+	close(r.leave)
+	
+	log.Printf("Room '%s' stopped", r.Name)
+	return nil
 }
