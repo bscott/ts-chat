@@ -1,0 +1,16 @@
+[Unit]
+Description=Terminal Chat Server
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/chat-server
+Restart=on-failure
+RestartSec=5
+Environment=PORT=2323
+Environment=ROOM_NAME=Chat Room
+Environment=MAX_USERS=10
+
+[Install]
+WantedBy=multi-user.target

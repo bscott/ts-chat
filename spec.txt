@@ -1,0 +1,108 @@
+Project Title: Tailscale Terminal Chat Room (TTC)
+
+Summary:
+An open-source Go application that allows users to host terminal-based chat rooms over Tailscale using tsnet. The chat server is embedded in the binary and runs its own Tailscale node. Clients connect over the Tailnet via SSH or TCP terminal emulation. Access can be shared using Tailscale Sharing.
+
+⸻
+
+Goals:
+	•	Build a chat server in Go, accessible via terminal
+	•	Use tsnet to embed Tailscale in the binary (no external tailscaled)
+	•	Allow users to run a chat room on their Tailnet and optionally share it
+	•	Clients connect via a Tailscale IP or hostname.ts.net DNS name
+
+⸻
+
+Architecture Overview:
+
+Components:
+	1.	Go Chat Server with tsnet
+	•	Starts its own embedded Tailscale node
+	•	Listens on tcp/:2323 inside the Tailnet
+	•	Each instance registers its hostname (e.g., chatroom.ts.net)
+	2.	Terminal Interface
+	•	When users connect via TCP, they see a terminal-based interface
+	•	ANSI rendering (e.g., text UI, usernames, etc.)
+	•	Built with native Go or terminal libraries like BubbleTea
+	3.	Tailscale Sharing
+	•	Owners can share their service with users outside their Tailnet via tailscale.com/admin/shares
+
+    Client Access:
+	•	Tailscale users connect via:
+        telnet chatroom.ts.net 2323
+
+Tailscale Sharing: shared users get access via Tailscale’s sharing feature — no need to join the Tailnet
+
+⸻
+
+Minimum Features:
+	•	Choose nickname on connect
+	•	Chat broadcast to all users
+	•	Basic commands: /who, /me, /help, /quit
+	•	Configurable port and room name
+
+⸻
+
+Config Options:
+	•	PORT=2323
+	•	HOSTNAME=chatroom
+	•	ROOM_NAME="Tailscale Tavern"
+	•	MAX_USERS=10
+	•	USE_AUTH=false (future option for password-protected rooms)
+
+⸻
+
+Security:
+	•	Encrypted end-to-end via Tailscale
+	•	Only discoverable within Tailnet or by shared users
+	•	Optional: basic rate-limiting, max users, admin commands
+
+⸻
+
+Tech Stack:
+	•	Language: Go
+	•	Tailscale Integration: tailscale.com/tsnet
+	•	Terminal Rendering: ANSI escape codes or BubbleTea
+
+⸻
+
+Distribution:
+	•	Single self-contained binary: tailscale-chat
+	•	Cross-compilation for ARM (Raspberry Pi), Linux, macOS, Windows
+	•	Optional Dockerfile
+	•	Provide systemd .service file for auto-start on boot
+
+Usage Example (Host):
+# Run the server
+./tailscale-chat --port 2323 --hostname chatroom
+
+# Visit https://login.tailscale.com/admin/shares to share it
+
+Client Example (Peer or Shared User):
+# Connect via Netcat
+nc chatroom.ts.net 2323
+
+# Or Telnet
+telnet chatroom.ts.net 2323
+
+Roadmap:
+	•	Phase 1: MVP with TCP socket, nickname, broadcast
+	•	Phase 2: Fancy terminal UI (BubbleTea), formatting
+	•	Phase 3: Room management, admin commands
+	•	Phase 4: Chat history (in-memory or disk)
+	•	Phase 5: Web read-only viewer (optional)
+
+⸻
+
+Inspirations:
+	•	ssh-chat
+	•	tailscale.com/tsnet
+	•	BubbleTea
+
+⸻
+
+Optional Enhancements:
+	•	Prometheus metrics
+	•	CLI dashboard for room stats
+	•	Password-protected rooms
+	•	Funnel integration (public anonymous access)
